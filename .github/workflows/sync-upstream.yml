@@ -1,0 +1,154 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'SuddenCast03405/HMCL-fork'
+    runs-on: ubuntu-latest
+    env:
+      FORK: SuddenCast03405/HMCL-fork
+      UPSTREAM: HMCL-dev/HMCL
+      BRANCH: main
+      PATCH_TRAILER: 'HMCL-CN-Patch:'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      # Read-only on purpose: the push URL points at an unusable host, so no step in this
+      # workflow can ever write to HMCL-dev/HMCL even if a push command is added later.
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git remote set-url --push upstream "https://invalid.invalid/never-push.git"
+          git fetch --no-tags --prune upstream "$BRANCH"
+          echo "upstream=$(git rev-parse upstream/$BRANCH)" >> "$GITHUB_ENV"
+
+      - name: Split the local commits from the upstream ones
+        run: |
+          : > patches.txt
+          : > foreign.txt
+          for sha in $(git rev-list --reverse "upstream/$BRANCH..$BRANCH"); do
+            if git show -s --format=%B "$sha" | grep -qF "$PATCH_TRAILER"; then
+              echo "$sha" >> patches.txt
+            else
+              echo "$sha" >> foreign.txt
+            fi
+          done
+          echo "patch series:"
+          cat patches.txt | while read -r s; do echo "  $(git log -1 --format='%h %s' "$s")"; done
+          test -s patches.txt || { echo "No commits tagged with '$PATCH_TRAILER' on $BRANCH." >&2; exit 1; }
+          # Commits without the trailer would be silently dropped by the rewrite below.
+          test -s foreign.txt || exit 0
+          echo "Commits on $BRANCH without '$PATCH_TRAILER' would be lost:" >&2
+          while read -r s; do echo "  $(git log -1 --format='%h %s' "$s")" >&2; done < foreign.txt
+          exit 1
+
+      - name: Skip when upstream has not moved
+        id: check
+        run: |
+          base="$(git rev-parse "$(head -1 patches.txt)^")"
+          if [ "$base" = "$upstream" ]; then
+            echo "fork main is already replayed onto $upstream, nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "rebasing patches from $base onto $upstream"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v6
+        if: steps.check.outputs.changed == 'true'
+        with:
+          distribution: 'liberica'
+          java-version: '17'
+          java-package: 'jdk+fx'
+
+      - uses: gradle/actions/setup-gradle@v5
+        if: steps.check.outputs.changed == 'true'
+        with:
+          cache-cleanup: never
+
+      - name: Replay the patches onto the new upstream
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git checkout -q -B rebuilt "$upstream"
+          while read -r sha; do
+            if ! git cherry-pick "$sha" > /dev/null 2>&1 < /dev/null; then
+              git cherry-pick --abort > /dev/null 2>&1 || true
+              echo "Patch $(git log -1 --format='%h %s' "$sha") no longer applies cleanly." >&2
+              exit 1
+            fi
+          done < patches.txt
+          git log --oneline -n 8
+
+      # Cheap gate: prove the patches still apply and compile. The jar/exe/deb packaging
+      # is done by gradle.yml, which the push below triggers.
+      - name: Validate the patched tree
+        if: steps.check.outputs.changed == 'true'
+        run: ./gradlew checkstyleMain checkTranslations :HMCL:compileJava --no-daemon --parallel --stacktrace < /dev/null
+        env:
+          JAVA_TOOL_OPTIONS: -Djava.awt.headless=true
+
+      - name: Publish the patched main
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git push "https://github-actions:${GITHUB_TOKEN}@github.com/${FORK}.git" \
+            "refs/heads/rebuilt:refs/heads/$BRANCH" --force
+          echo "published $(git rev-parse --short HEAD)" | tee -a results.txt
+
+      - name: Summarize
+        run: |
+          {
+            echo "Upstream: https://github.com/${UPSTREAM}/commit/${upstream}"
+            echo
+            echo '```'
+            cat results.txt 2>/dev/null || echo 'no upstream change, nothing published'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report a sync failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILURE_MARK: '<!-- hmcl-cn-sync-failure -->'
+        run: |
+          body="$(printf '%s\n' \
+            "上游更新后，main 上的本地补丁无法干净重放或编译校验失败，分支没有被改写。" \
+            "" \
+            "上游：https://github.com/${UPSTREAM}/commit/${upstream}" \
+            "失败的运行：<${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}>" \
+            "" \
+            "$FAILURE_MARK")"
+          existing="$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues?state=open&labels=sync&per_page=20" \
+            | jq -r --arg mark "$FAILURE_MARK" '[.[] | select((.body // "") | contains($mark))][0].number // empty')"
+          if [ -n "$existing" ]; then
+            curl -sf -X PATCH -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$existing" \
+              -d "$(jq -n --arg body "$body" '{body: $body}')" >/dev/null
+          else
+            curl -sf -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/issues" \
+              -d "$(jq -n --arg title '上游同步失败：main 上的补丁需要手动修复' --arg body "$body" \
+                   '{title: $title, body: $body, labels: ["sync"]}')" >/dev/null
+          fi
