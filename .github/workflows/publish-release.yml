@@ -1,0 +1,80 @@
+name: Publish CN build
+
+on:
+  workflow_run:
+    workflows: ['Java CI']
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-cn-build
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Only the patched main branch is published, and only from a green build.
+    if: >-
+      github.repository == 'SuddenCast03405/HMCL-fork' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      TAG: cn-latest
+      FORK: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pattern: 'HMCL-*'
+          merge-multiple: true
+          path: dist
+
+      - name: Collect the build outputs
+        run: |
+          find dist -type f \( -name 'HMCL-*.jar' -o -name 'HMCL-*.exe' -o -name 'HMCL-*.sh' -o -name 'HMCL-*.deb' \) -printf '%f\n' | sort > files.txt
+          test -s files.txt || { echo "Run $RUN_ID produced no HMCL artifact." >&2; exit 1; }
+          version="$(sed -n 's/^HMCL-\([0-9][^.]*\(\.[0-9]*\)*\)\.\(jar\|exe\|sh\|deb\)$/\1/p' files.txt | head -1)"
+          test -n "$version" || { echo "Cannot read the version from: $(cat files.txt | tr '\n' ' ')" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_ENV"
+
+      - name: Write the release note
+        run: |
+          {
+            echo "本仓库是 [HMCL-dev/HMCL](https://github.com/HMCL-dev/HMCL) 的 fork，在此版本上强制应用了以下改动："
+            echo
+            echo "- 中国大陆地区每次启动时确认年满 22 周岁并同意 Minecraft EULA"
+            echo "- 下载功能不再被中国大陆网络区域判定拦截"
+            echo "- 下载源选择回退到按系统 Locale 判定"
+            echo
+            echo "对应 fork 提交：https://github.com/${FORK}/commit/${SHA}"
+            echo "上游最新版本：https://github.com/HMCL-dev/HMCL/commits/main"
+            echo "完整构建日志：https://github.com/${FORK}/actions/runs/${RUN_ID}"
+            echo
+            echo '| 文件 | SHA-256 |'
+            echo '| :--- | :--- |'
+            (cd dist && while IFS= read -r f; do
+              echo "| $f | \`$(sha256sum "$f" | cut -d' ' -f1)\` |"
+            done < ../files.txt)
+          } > RELEASE_NOTE
+
+      # The tag moves with every build, so the old release is removed instead of
+      # letting stale assets pile up under names that no longer exist.
+      - name: Replace the rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "$TAG" --cleanup-tag --yes > /dev/null 2>&1 || true
+          mapfile -t assets < files.txt
+          cd dist
+          gh release create "$TAG" "${assets[@]}" \
+            --target "$SHA" \
+            --title "HMCL ${version} 中国国内补丁版" \
+            --notes-file ../RELEASE_NOTE \
+            --prerelease
