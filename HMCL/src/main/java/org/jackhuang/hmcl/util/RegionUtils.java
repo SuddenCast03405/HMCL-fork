@@ -107,7 +107,20 @@ public final class RegionUtils {
         }
     }
 
+    /// Whether the download pages should be gated by the detected network region.
+    ///
+    /// This fork keeps game downloads available in Chinese Mainland, so the gate is pinned off
+    /// at its single source: re-introducing a {@code isIsChinaMainlandNetwork()} check on a
+    /// download page upstream cannot block downloads here again.
+    private static final boolean GATE_DOWNLOADS_BY_NETWORK = false;
+
     public static boolean isIsChinaMainlandNetwork() {
+        return GATE_DOWNLOADS_BY_NETWORK && detectChinaMainlandNetwork();
+    }
+
+    /// Performs the actual network detection, kept separate so that the gate above can be
+    /// switched off without leaving unreachable code behind.
+    private static boolean detectChinaMainlandNetwork() {
         Boolean value = isChinaMainlandNetwork;
         if (value != null)
             return value;
