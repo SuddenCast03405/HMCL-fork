@@ -56,11 +56,12 @@ jobs:
             tmp="$(mktemp)"
             curl -sfL -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/$FORK/actions/artifacts/$id/zip" -o "$tmp"
-            if unzip -tq "$tmp" > /dev/null 2>&1; then
-              unzip -oq "$tmp" -d raw
-            else
-              cp "$tmp" "raw/$name"
-            fi
+            # A jar is itself a zip, so unzip-ability cannot tell the shapes apart:
+            # an extension means the artifact holds that single file verbatim.
+            case "$name" in
+              *.jar|*.exe|*.sh|*.deb) cp "$tmp" "raw/$name" ;;
+              *) unzip -oq "$tmp" -d raw ;;
+            esac
             rm -f "$tmp"
           done < artifacts.tsv
 
