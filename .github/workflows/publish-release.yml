@@ -28,20 +28,49 @@ jobs:
       SHA: ${{ github.event.workflow_run.head_sha }}
 
     steps:
-      - uses: actions/download-artifact@v7
-        with:
-          run-id: ${{ env.RUN_ID }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          pattern: 'HMCL-*'
-          merge-multiple: true
-          path: dist
+      # The build uploads raw files (upload-artifact runs with archive: false), so the
+      # download URL returns the binary itself rather than a zip, which is why the
+      # download-artifact action cannot consume it. Fetching through the API and keeping
+      # whichever shape arrives handles archived and raw artifacts alike.
+      - name: Download the build outputs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p raw dist
+          python3 - <<'PY' > artifacts.tsv
+          import json, os, urllib.request
+
+          token, run, repo = os.environ['GH_TOKEN'], os.environ['RUN_ID'], os.environ['FORK']
+          req = urllib.request.Request(
+              f'https://api.github.com/repos/{repo}/actions/runs/{run}/artifacts?per_page=100',
+              headers={'Authorization': f'Bearer {token}',
+                       'Accept': 'application/vnd.github+json',
+                       'User-Agent': 'hmcl-cn-publish'})
+          with urllib.request.urlopen(req) as response:
+              for artifact in json.load(response)['artifacts']:
+                  if not artifact['expired']:
+                      print(f"{artifact['id']}\t{artifact['name']}")
+          PY
+          while IFS=$'\t' read -r id name; do
+            [ -n "$id" ] || continue
+            tmp="$(mktemp)"
+            curl -sfL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$FORK/actions/artifacts/$id/zip" -o "$tmp"
+            if unzip -tq "$tmp" > /dev/null 2>&1; then
+              unzip -oq "$tmp" -d raw
+            else
+              cp "$tmp" "raw/$name"
+            fi
+            rm -f "$tmp"
+          done < artifacts.tsv
 
       - name: Collect the build outputs
         run: |
-          find dist -type f \( -name 'HMCL-*.jar' -o -name 'HMCL-*.exe' -o -name 'HMCL-*.sh' -o -name 'HMCL-*.deb' \) -printf '%f\n' | sort > files.txt
+          find raw -type f \( -name 'HMCL-*.jar' -o -name 'HMCL-*.exe' -o -name 'HMCL-*.sh' -o -name 'HMCL-*.deb' \) -exec cp {} dist/ \;
+          find dist -type f -printf '%f\n' | sort > files.txt
           test -s files.txt || { echo "Run $RUN_ID produced no HMCL artifact." >&2; exit 1; }
-          version="$(sed -n 's/^HMCL-\([0-9][^.]*\(\.[0-9]*\)*\)\.\(jar\|exe\|sh\|deb\)$/\1/p' files.txt | head -1)"
-          test -n "$version" || { echo "Cannot read the version from: $(cat files.txt | tr '\n' ' ')" >&2; exit 1; }
+          version="$(sed -n 's/^HMCL-\(.*\)\.\(jar\|exe\|sh\|deb\)$/\1/p' files.txt | head -1)"
+          test -n "$version" || { echo "Cannot read the version from: $(tr '\n' ' ' < files.txt)" >&2; exit 1; }
           echo "version=$version" >> "$GITHUB_ENV"
 
       - name: Write the release note
