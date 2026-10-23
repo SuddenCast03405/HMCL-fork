@@ -21,7 +21,11 @@ import com.jfoenix.controls.JFXCheckBox;
 import javafx.application.Platform;
 import javafx.beans.binding.Bindings;
 import javafx.geometry.Insets;
+import javafx.geometry.Pos;
+import javafx.scene.layout.HBox;
+import javafx.scene.layout.Priority;
 import javafx.scene.layout.VBox;
+import javafx.scene.text.TextFlow;
 import org.jackhuang.hmcl.ui.construct.DialogCloseEvent;
 import org.jackhuang.hmcl.ui.construct.DialogPane;
 import org.jackhuang.hmcl.ui.construct.HintPane;
@@ -41,7 +45,7 @@ import static org.jackhuang.hmcl.util.i18n.I18n.i18n;
 public final class ChinaCompliancePane extends DialogPane {
 
     /// The checkbox confirming the user is at least 22 years old.
-    private final JFXCheckBox ageCheckBox = new JFXCheckBox(i18n("china_compliance.age"));
+    private final JFXCheckBox ageCheckBox = new JFXCheckBox();
 
     /// The checkbox confirming the user accepts the Minecraft End User License Agreement.
     private final JFXCheckBox eulaCheckBox = new JFXCheckBox();
@@ -56,9 +60,10 @@ public final class ChinaCompliancePane extends DialogPane {
         HintPane hint = new HintPane(MessageDialogPane.MessageType.WARNING);
         hint.setText(i18n("china_compliance.notice"));
 
-        eulaCheckBox.setGraphic(segmentToTextFlow(i18n("china_compliance.eula"), Controllers::onHyperlinkAction));
-
-        VBox content = new VBox(8, hint, ageCheckBox, eulaCheckBox);
+        VBox content = new VBox(6,
+                hint,
+                createCheckBoxRow(ageCheckBox, i18n("china_compliance.age")),
+                createCheckBoxRow(eulaCheckBox, i18n("china_compliance.eula")));
         content.setPadding(new Insets(4, 0, 4, 0));
         setBody(content);
 
@@ -78,6 +83,21 @@ public final class ChinaCompliancePane extends DialogPane {
             event.consume();
             Platform.exit();
         });
+    }
+
+    /// Builds one statement with its checkbox, keeping the box and the text on the same line.
+    ///
+    /// The text is a sibling of the checkbox rather than its graphic: the checkbox skin lays
+    /// out its label with text metrics, so a graphic label ends up shifted against the box.
+    private static HBox createCheckBoxRow(JFXCheckBox checkBox, String text) {
+        TextFlow label = segmentToTextFlow(text, Controllers::onHyperlinkAction);
+        // The EULA link consumes its own clicks, so only plain text reaches this handler.
+        label.setOnMouseClicked(event -> checkBox.setSelected(!checkBox.isSelected()));
+
+        HBox row = new HBox(6, checkBox, label);
+        row.setAlignment(Pos.CENTER_LEFT);
+        HBox.setHgrow(label, Priority.ALWAYS);
+        return row;
     }
 
     /// Shows the compliance gate unless the machine is detected as being outside mainland China.
