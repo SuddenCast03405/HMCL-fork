@@ -71,7 +71,7 @@ jobs:
           test -s files.txt || { echo "Run $RUN_ID produced no HMCL artifact." >&2; exit 1; }
           version="$(sed -n 's/^HMCL-\(.*\)\.\(jar\|exe\|sh\|deb\)$/\1/p' files.txt | head -1)"
           test -n "$version" || { echo "Cannot read the version from: $(tr '\n' ' ' < files.txt)" >&2; exit 1; }
-          echo "version=$version" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
 
       # The note carries the official changelog and the checksums only; it deliberately does
       # not describe this fork or link back to its build.
@@ -101,19 +101,20 @@ jobs:
 
           # Prefer the changelog of the release being packaged, but fall back to the newest
           # published changelog when upstream has not written one for that build yet.
+          # Entries live in _changelogs/dev/<major.minor>/<full version>.md, so the first
+          # directory with a matching file is already the newest available one.
           def latest_entry():
               wanted = key(upstream_version)
-              dirs = [entry['name'] for entry in listdir('_changelogs/dev')
-                      if entry['type'] == 'dir' and key(entry['name']) <= wanted]
-              if not dirs:
-                  return None
-              directory = f'_changelogs/dev/{max(dirs, key=key)}'
-              files = [entry for entry in listdir(directory)
-                       if entry['type'] == 'file' and entry['name'].endswith('.md')
-                       and key(entry['name']) <= wanted]
-              if not files:
-                  return None
-              return max(files, key=lambda entry: key(entry['name']))
+              dirs = sorted((entry['name'] for entry in listdir('_changelogs/dev')
+                             if entry['type'] == 'dir' and key(entry['name']) <= wanted),
+                            key=key, reverse=True)
+              for name in dirs:
+                  files = [entry for entry in listdir(f'_changelogs/dev/{name}')
+                           if entry['type'] == 'file' and entry['name'].endswith('.md')
+                           and key(entry['name']) <= wanted]
+                  if files:
+                      return max(files, key=lambda entry: key(entry['name']))
+              return None
 
           try:
               entry = latest_entry()
@@ -155,13 +156,13 @@ jobs:
           # There is no checkout in a workflow_run job, so gh needs to be told the repo.
           GH_REPO: ${{ github.repository }}
         run: |
-          tag="v${version}"
+          tag="v${VERSION}"
           gh release delete "$tag" --cleanup-tag --yes > /dev/null 2>&1 || true
           gh release delete cn-latest --cleanup-tag --yes > /dev/null 2>&1 || true
           mapfile -t assets < files.txt
           cd dist
           gh release create "$tag" "${assets[@]}" \
             --target "$SHA" \
-            --title "$version" \
+            --title "$VERSION" \
             --notes-file ../RELEASE_NOTE \
             --prerelease
