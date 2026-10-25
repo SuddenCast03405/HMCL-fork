@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: sync-upstream
@@ -22,6 +23,11 @@ jobs:
       UPSTREAM: HMCL-dev/HMCL
       BRANCH: main
       PATCH_TRAILER: 'HMCL-CN-Patch:'
+      # A PAT is required to push changes under .github/workflows and, unlike
+      # GITHUB_TOKEN, its push triggers Java CI. Without it the build is dispatched
+      # explicitly below, but a sync that has to change a workflow file will fail.
+      PUSH_TOKEN: ${{ secrets.HMCL_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+      HAS_SYNC_TOKEN: ${{ secrets.HMCL_SYNC_TOKEN != '' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -112,9 +118,27 @@ jobs:
       - name: Publish the patched main
         if: steps.check.outputs.changed == 'true'
         run: |
-          git push "https://github-actions:${GITHUB_TOKEN}@github.com/${FORK}.git" \
+          git push "https://x-access-token:${PUSH_TOKEN}@github.com/${FORK}.git" \
             "refs/heads/rebuilt:refs/heads/$BRANCH" --force
           echo "published $(git rev-parse --short HEAD)" | tee -a results.txt
+
+      # Pushes made with GITHUB_TOKEN do not start other workflows. Java CI is therefore
+      # dispatched by hand when no PAT is configured; a PAT push already starts it.
+      - name: Start the build
+        if: steps.check.outputs.changed == 'true' && env.HAS_SYNC_TOKEN != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run gradle.yml --ref "$BRANCH"; then
+              echo "Java CI dispatched." | tee -a results.txt
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Cannot dispatch Java CI." >&2
+          exit 1
 
       - name: Summarize
         run: |
@@ -136,9 +160,9 @@ jobs:
           {
             echo '### 上游同步失败'
             echo
-            echo '上游更新后，main 上的本地补丁无法干净重放或编译校验失败，分支没有被改写。'
+            echo '上游更新后，本地补丁重放、编译校验、推送或构建触发失败，分支没有被改写。'
             echo
             echo "- 上游：${upstream_url}"
             echo "- 失败的运行：${run_url}"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::error title=上游同步失败::本地补丁无法干净重放或编译校验失败，详见 ${run_url}"
+          echo "::error title=上游同步失败::本地补丁重放、编译校验、推送或构建触发失败，详见 ${run_url}"
