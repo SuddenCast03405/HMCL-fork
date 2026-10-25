@@ -73,19 +73,71 @@ jobs:
           test -n "$version" || { echo "Cannot read the version from: $(tr '\n' ' ' < files.txt)" >&2; exit 1; }
           echo "version=$version" >> "$GITHUB_ENV"
 
+      # The note carries the official changelog and the checksums only; it deliberately does
+      # not describe this fork or link back to its build.
       - name: Write the release note
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          python3 - <<'PY' > CHANGELOG.md
+          import json, os, re, sys, urllib.request
+
+          token = os.environ['GH_TOKEN']
+          upstream_version = os.environ['VERSION'].split('-unofficial.')[0]
+
+          def get(url):
+              request = urllib.request.Request(url, headers={
+                  'Authorization': f'Bearer {token}',
+                  'Accept': 'application/vnd.github+json',
+                  'User-Agent': 'hmcl-cn-publish'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return response.read()
+
+          def key(name):
+              return tuple(int(part) for part in re.findall(r'\d+', name))
+
+          def listdir(path):
+              return json.loads(get(f'https://api.github.com/repos/HMCL-dev/HMCL-docs/contents/{path}'))
+
+          # Prefer the changelog of the release being packaged, but fall back to the newest
+          # published changelog when upstream has not written one for that build yet.
+          def latest_entry():
+              wanted = key(upstream_version)
+              dirs = [entry['name'] for entry in listdir('_changelogs/dev')
+                      if entry['type'] == 'dir' and key(entry['name']) <= wanted]
+              if not dirs:
+                  return None
+              directory = f'_changelogs/dev/{max(dirs, key=key)}'
+              files = [entry for entry in listdir(directory)
+                       if entry['type'] == 'file' and entry['name'].endswith('.md')
+                       and key(entry['name']) <= wanted]
+              if not files:
+                  return None
+              return max(files, key=lambda entry: key(entry['name']))
+
+          try:
+              entry = latest_entry()
+              text = get(entry['download_url']).decode('utf-8') if entry else ''
+          except Exception as error:
+              print(f'Cannot fetch the official changelog: {error}', file=sys.stderr)
+              entry, text = None, ''
+
+          if text.count('---') >= 2:
+              text = text.split('---', 2)[2]
+          text = text.strip()
+
+          print('## 官方更新日志\n')
+          if entry and text:
+              changelog_version = entry['name'][:-3]
+              # Upstream sometimes publishes builds before writing their changelog.
+              note = '' if changelog_version == upstream_version else '（当前最新公开日志）'
+              print(f'### HMCL {changelog_version}{note}\n')
+              print(text)
+          else:
+              print('https://docs.hmcl.net/changelog/dev.html')
+          PY
           {
-            echo "本仓库是 [HMCL-dev/HMCL](https://github.com/HMCL-dev/HMCL) 的 fork，在此版本上强制应用了以下改动："
-            echo
-            echo "- 中国大陆地区每次启动时确认年满 22 周岁并同意 Minecraft EULA"
-            echo "- 下载功能不再被中国大陆网络区域判定拦截"
-            echo "- 下载源选择回退到按系统 Locale 判定"
-            echo
-            echo "对应 fork 提交：https://github.com/${FORK}/commit/${SHA}"
-            echo "官方更新日志：https://docs.hmcl.net/changelog/dev.html"
-            echo "官方最新版本：https://github.com/HMCL-dev/HMCL/commits/main"
-            echo "完整构建日志：https://github.com/${FORK}/actions/runs/${RUN_ID}"
+            cat CHANGELOG.md
             echo
             echo '| 文件 | SHA-256 |'
             echo '| :--- | :--- |'
