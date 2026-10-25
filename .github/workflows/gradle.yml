@@ -23,10 +23,20 @@ jobs:
       uses: gradle/actions/setup-gradle@v5
       with:
         cache-cleanup: never
+    - name: Resolve the upstream version
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        version="$(curl -sf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+          'https://api.github.com/repos/HMCL-dev/HMCL/releases?per_page=1' \
+          | jq -r '.[0].tag_name // empty' | sed 's/^v//')"
+        test -n "$version" || { echo "Cannot read the latest upstream release version." >&2; exit 1; }
+        echo "VERSION_ROOT=$version" >> "$GITHUB_ENV"
     - name: Build with Gradle
       run: xvfb-run --auto-servernum ./gradlew build --no-daemon --parallel
       env:
         JAVA_TOOL_OPTIONS: -Djava.awt.headless=true
+        BUILD_NUMBER: ${{ github.run_number }}
         MICROSOFT_AUTH_ID: ${{ secrets.MICROSOFT_AUTH_ID }}
         CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
     - name: Get short SHA
