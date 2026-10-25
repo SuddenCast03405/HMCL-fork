@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
 
 concurrency:
   group: sync-upstream
@@ -126,29 +125,19 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Issues are disabled on this fork, so the failure is surfaced through the step summary
+      # and an error annotation instead of an issue.
       - name: Report a sync failure
         if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FAILURE_MARK: '<!-- hmcl-cn-sync-failure -->'
         run: |
-          body="$(printf '%s\n' \
-            "上游更新后，main 上的本地补丁无法干净重放或编译校验失败，分支没有被改写。" \
-            "" \
-            "上游：https://github.com/${UPSTREAM}/commit/${upstream}" \
-            "失败的运行：<${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}>" \
-            "" \
-            "$FAILURE_MARK")"
-          existing="$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues?state=open&labels=sync&per_page=20" \
-            | jq -r --arg mark "$FAILURE_MARK" '[.[] | select((.body // "") | contains($mark))][0].number // empty')"
-          if [ -n "$existing" ]; then
-            curl -sf -X PATCH -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$existing" \
-              -d "$(jq -n --arg body "$body" '{body: $body}')" >/dev/null
-          else
-            curl -sf -X POST -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/issues" \
-              -d "$(jq -n --arg title '上游同步失败：main 上的补丁需要手动修复' --arg body "$body" \
-                   '{title: $title, body: $body, labels: ["sync"]}')" >/dev/null
-          fi
+          upstream_url="https://github.com/${UPSTREAM}/commit/${upstream}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo '### 上游同步失败'
+            echo
+            echo '上游更新后，main 上的本地补丁无法干净重放或编译校验失败，分支没有被改写。'
+            echo
+            echo "- 上游：${upstream_url}"
+            echo "- 失败的运行：${run_url}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=上游同步失败::本地补丁无法干净重放或编译校验失败，详见 ${run_url}"
