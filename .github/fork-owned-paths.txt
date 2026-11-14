@@ -1,0 +1,15 @@
+# Files the fork publishes in its own shape.
+#
+# .github/workflows/sync-upstream.yml rebuilds `main` as upstream + the HMCL-CN-Patch
+# commit series. When a patch that edits one of these files no longer replays onto the
+# new upstream (upstream changed the same lines), the replay keeps the patch's version
+# instead of merging hunk by hunk, because the fork copy is meant to replace upstream's.
+#
+# Only list a path here when that replacement is intended, i.e. when dropping upstream's
+# changes to it is what the fork wants. Everything else conflicts loudly and fails the run.
+#
+# Why gradle.yml: upstream runs one job per OS/JDK combination for testing; this fork
+# builds once (ubuntu-latest, JDK 17) and publishes that single build, because
+# publish-release.yml turns one run into exactly one release and labels it with
+# BUILD_NUMBER = github.run_number.
+.github/workflows/gradle.yml
