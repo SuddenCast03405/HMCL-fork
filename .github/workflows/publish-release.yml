@@ -4,6 +4,16 @@ on:
   workflow_run:
     workflows: ['Java CI']
     types: [completed]
+  # A build started with workflow_dispatch does not produce a workflow_run event, so the
+  # sync workflow publishes such a build explicitly by passing the run it just watched.
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Java CI run that produced the artifacts'
+        required: true
+      sha:
+        description: 'Commit that run built'
+        required: true
 
 permissions:
   contents: write
@@ -18,13 +28,14 @@ jobs:
     # Only the patched main branch is published, and only from a green build.
     if: >-
       github.repository == 'SuddenCast03405/HMCL-fork' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.conclusion == 'success'
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.conclusion == 'success'))
     runs-on: ubuntu-latest
     env:
       FORK: ${{ github.repository }}
-      RUN_ID: ${{ github.event.workflow_run.id }}
-      SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+      SHA: ${{ inputs.sha || github.event.workflow_run.head_sha }}
 
     steps:
       # The build uploads raw files (upload-artifact runs with archive: false), so the

@@ -201,29 +201,65 @@ jobs:
           JAVA_TOOL_OPTIONS: -Djava.awt.headless=true
 
       - name: Publish the patched main
+        id: publish
         if: steps.check.outputs.changed == 'true'
+        env:
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git push "https://x-access-token:${PUSH_TOKEN}@github.com/${FORK}.git" \
-            "refs/heads/rebuilt:refs/heads/$BRANCH" --force
-          echo "published $(git rev-parse --short HEAD)" | tee -a "$RUNNER_TEMP/results.txt"
+          push() {
+            git push "https://x-access-token:$1@github.com/${FORK}.git" \
+              "refs/heads/rebuilt:refs/heads/$BRANCH" --force
+          }
+          if push "$PUSH_TOKEN"; then
+            echo "published $(git rev-parse --short HEAD)" | tee -a "$RUNNER_TEMP/results.txt"
+            if [ "$HAS_SYNC_TOKEN" = 'true' ]; then
+              # A PAT push starts Java CI by itself and that run reaches publish-release.yml
+              # through the workflow_run trigger, so nothing has to be dispatched here.
+              echo "dispatch=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            echo "::warning::the sync token cannot push this branch, retrying with GITHUB_TOKEN"
+            push "$FALLBACK_TOKEN"
+            echo "published $(git rev-parse --short HEAD) (GITHUB_TOKEN)" | tee -a "$RUNNER_TEMP/results.txt"
+          fi
+          echo "dispatch=true" >> "$GITHUB_OUTPUT"
 
-      # Pushes made with GITHUB_TOKEN do not start other workflows. Java CI is therefore
-      # dispatched by hand when no PAT is configured; a PAT push already starts it.
+      # Pushes made with GITHUB_TOKEN do not start other workflows, and a build started by
+      # workflow_dispatch produces no workflow_run event either, so such a build has to be
+      # published explicitly once it is green. Without this the sync would update main and
+      # leave the build sitting in Actions.
       - name: Start the build
-        if: steps.check.outputs.changed == 'true' && env.HAS_SYNC_TOKEN != 'true'
+        if: steps.check.outputs.changed == 'true' && steps.publish.outputs.dispatch == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
+          sha="$(git rev-parse HEAD)"
+          run_id=""
           for attempt in 1 2 3 4 5; do
-            if gh workflow run gradle.yml --ref "$BRANCH"; then
-              echo "Java CI dispatched." | tee -a "$RUNNER_TEMP/results.txt"
-              exit 0
-            fi
+            if gh workflow run gradle.yml --ref "$BRANCH"; then break; fi
+            if [ "$attempt" = 5 ]; then echo "Cannot dispatch Java CI." >&2; exit 1; fi
             sleep 5
           done
-          echo "Cannot dispatch Java CI." >&2
-          exit 1
+
+          for attempt in $(seq 1 60); do
+            run_id="$(gh run list --workflow gradle.yml --branch "$BRANCH" --limit 20 \
+              --json databaseId,headSha \
+              --jq "[.[] | select(.headSha == \"$sha\")][0].databaseId // empty")"
+            [ -n "$run_id" ] && break
+            sleep 5
+          done
+          test -n "$run_id" || { echo "Cannot find the Java CI run for $sha." >&2; exit 1; }
+          echo "Java CI run $run_id started." | tee -a "$RUNNER_TEMP/results.txt"
+
+          if gh run watch "$run_id" --exit-status --interval 15; then
+            gh workflow run publish-release.yml --ref "$BRANCH" -f run_id="$run_id" -f sha="$sha"
+            echo "Publishing run $run_id." | tee -a "$RUNNER_TEMP/results.txt"
+          else
+            echo "::warning::Java CI run $run_id failed, nothing was published"
+            echo "Java CI run $run_id failed, nothing published." | tee -a "$RUNNER_TEMP/results.txt"
+          fi
 
       - name: Summarize
         run: |
