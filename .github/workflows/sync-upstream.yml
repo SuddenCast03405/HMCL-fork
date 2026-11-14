@@ -23,6 +23,9 @@ jobs:
       UPSTREAM: HMCL-dev/HMCL
       BRANCH: main
       PATCH_TRAILER: 'HMCL-CN-Patch:'
+      # Paths the fork publishes as its own copy, see .github/fork-owned-paths.txt.
+      FORK_OWNED: .github/fork-owned-paths.txt
+      # Scratch files live in $RUNNER_TEMP, outside the work tree, so branch switching stays clean.
       # A PAT is required to push changes under .github/workflows and, unlike
       # GITHUB_TOKEN, its push triggers Java CI. Without it the build is dispatched
       # explicitly below, but a sync that has to change a workflow file will fail.
@@ -52,28 +55,28 @@ jobs:
 
       - name: Split the local commits from the upstream ones
         run: |
-          : > patches.txt
-          : > foreign.txt
+          : > "$RUNNER_TEMP/patches.txt"
+          : > "$RUNNER_TEMP/foreign.txt"
           for sha in $(git rev-list --reverse "upstream/$BRANCH..$BRANCH"); do
             if git show -s --format=%B "$sha" | grep -qF "$PATCH_TRAILER"; then
-              echo "$sha" >> patches.txt
+              echo "$sha" >> "$RUNNER_TEMP/patches.txt"
             else
-              echo "$sha" >> foreign.txt
+              echo "$sha" >> "$RUNNER_TEMP/foreign.txt"
             fi
           done
           echo "patch series:"
-          cat patches.txt | while read -r s; do echo "  $(git log -1 --format='%h %s' "$s")"; done
-          test -s patches.txt || { echo "No commits tagged with '$PATCH_TRAILER' on $BRANCH." >&2; exit 1; }
+          while read -r s; do echo "  $(git log -1 --format='%h %s' "$s")"; done < "$RUNNER_TEMP/patches.txt"
+          test -s "$RUNNER_TEMP/patches.txt" || { echo "No commits tagged with '$PATCH_TRAILER' on $BRANCH." >&2; exit 1; }
           # Commits without the trailer would be silently dropped by the rewrite below.
-          test -s foreign.txt || exit 0
+          test -s "$RUNNER_TEMP/foreign.txt" || exit 0
           echo "Commits on $BRANCH without '$PATCH_TRAILER' would be lost:" >&2
-          while read -r s; do echo "  $(git log -1 --format='%h %s' "$s")" >&2; done < foreign.txt
+          while read -r s; do echo "  $(git log -1 --format='%h %s' "$s")" >&2; done < "$RUNNER_TEMP/foreign.txt"
           exit 1
 
       - name: Skip when upstream has not moved
         id: check
         run: |
-          base="$(git rev-parse "$(head -1 patches.txt)^")"
+          base="$(git rev-parse "$(head -1 "$RUNNER_TEMP/patches.txt")^")"
           if [ "$base" = "$upstream" ]; then
             echo "fork main is already replayed onto $upstream, nothing to do."
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -94,18 +97,100 @@ jobs:
         with:
           cache-cleanup: never
 
+      # Upstream rewrote gradle.yml into an OS/JDK matrix on 2026-11-13, i.e. it edits the
+      # same workflow the patch series edits, so a hunk-by-hunk replay cannot succeed every
+      # day. Two deterministic rules keep the replay convergent; anything else still fails
+      # the run and names the files instead of reporting a bare "no longer applies".
       - name: Replay the patches onto the new upstream
         if: steps.check.outputs.changed == 'true'
         run: |
+          : > "$RUNNER_TEMP/conflicts.txt"
+          : > "$RUNNER_TEMP/resolved.txt"
+
+          # The manifest is itself part of the patch series, so it is not on disk until the
+          # replay reaches that commit; read it from the branch that is about to be rewritten.
+          manifest="$RUNNER_TEMP/fork-owned.txt"
+          git show "${BRANCH}:${FORK_OWNED}" 2>/dev/null | grep -v '^[[:space:]]*#' > "$manifest" || true
+          is_fork_owned() {
+            grep -qxF -- "$1" "$manifest"
+          }
+
           git checkout -q -B rebuilt "$upstream"
+
           while read -r sha; do
-            if ! git cherry-pick "$sha" > /dev/null 2>&1 < /dev/null; then
+            if git cherry-pick "$sha" > /dev/null 2>&1 < /dev/null; then
+              continue
+            fi
+
+            mapfile -t pending < <(git diff --name-only --diff-filter=U)
+            if [ "${#pending[@]}" -eq 0 ]; then
+              echo "Patch $(git log -1 --format='%h %s' "$sha") stopped the replay without a conflict:" >&2
+              git status --short >&2 || true
               git cherry-pick --abort > /dev/null 2>&1 || true
-              echo "Patch $(git log -1 --format='%h %s' "$sha") no longer applies cleanly." >&2
               exit 1
             fi
-          done < patches.txt
+
+            blocked=0
+            for path in "${pending[@]}"; do
+              if ! git cat-file -e "${sha}:${path}" 2>/dev/null; then
+                # The patch deletes this file. Dropping it is the patch's intent and it has
+                # to win over upstream having edited the file in the meantime.
+                git rm -q -f --ignore-unmatch -- "$path"
+                echo "deleted \`${path}\` (patch $(git rev-parse --short "$sha"))" >> "$RUNNER_TEMP/resolved.txt"
+              elif is_fork_owned "$path"; then
+                # The fork publishes its own copy of this file, so the patch's version is
+                # taken whole; the overlay below makes that final either way.
+                git checkout "$sha" -- "$path"
+                echo "kept the fork version of \`${path}\` (patch $(git rev-parse --short "$sha"))" >> "$RUNNER_TEMP/resolved.txt"
+              else
+                echo "\`${path}\` (patch $(git rev-parse --short "$sha"))" >> "$RUNNER_TEMP/conflicts.txt"
+                blocked=1
+              fi
+            done
+
+            if [ "$blocked" -ne 0 ]; then
+              echo "Patch $(git log -1 --format='%h %s' "$sha") conflicts outside $FORK_OWNED:" >&2
+              cat "$RUNNER_TEMP/conflicts.txt" >&2
+              git diff --diff-filter=U --stat >&2 || true
+              git cherry-pick --abort > /dev/null 2>&1 || true
+              exit 1
+            fi
+
+            # --allow-empty keeps the patch series 1:1 with the local commits even when a
+            # resolution gives the tree exactly what upstream already had.
+            if ! GIT_EDITOR=true git cherry-pick --continue > /dev/null 2>&1 < /dev/null; then
+              GIT_EDITOR=true git commit --allow-empty --no-edit -C "$sha" > /dev/null
+              git cherry-pick --quit > /dev/null 2>&1 || true
+            fi
+          done < "$RUNNER_TEMP/patches.txt"
+
+          # A fork-owned file is published exactly as the fork had it, no matter how the
+          # patches above merged it: upstream may have restructured the file, and a partial
+          # merge of that into the fork's copy yields a workflow nobody wrote. Restoring the
+          # previous main's copy here is deterministic and independent of upstream's edits.
+          while read -r path; do
+            [ -n "$path" ] || continue
+            git cat-file -e "${BRANCH}:${path}" 2>/dev/null || continue
+            if git diff --quiet "$BRANCH" -- "$path"; then continue; fi
+            git checkout "$BRANCH" -- "$path"
+            echo "restored \`${path}\` from $BRANCH" >> "$RUNNER_TEMP/resolved.txt"
+          done < "$manifest"
+
+          if ! git diff --cached --quiet; then
+            # Amending the previous overlay commit (when it is the tip, which it is on every
+            # later sync) keeps exactly one such commit in the series instead of one a day.
+            if git log -1 --format=%B | grep -qF "${PATCH_TRAILER} overlay"; then
+              git commit -q --amend --no-edit
+            else
+              git commit -q -m "Reapply the fork-owned files over upstream" -m "${PATCH_TRAILER} overlay"
+            fi
+          fi
+
           git log --oneline -n 8
+          if [ -s "$RUNNER_TEMP/resolved.txt" ]; then
+            echo "auto-resolved during the replay:"
+            cat "$RUNNER_TEMP/resolved.txt"
+          fi
 
       # Cheap gate: prove the patches still apply and compile. The jar/exe/deb packaging
       # is done by gradle.yml, which the push below triggers.
@@ -120,7 +205,7 @@ jobs:
         run: |
           git push "https://x-access-token:${PUSH_TOKEN}@github.com/${FORK}.git" \
             "refs/heads/rebuilt:refs/heads/$BRANCH" --force
-          echo "published $(git rev-parse --short HEAD)" | tee -a results.txt
+          echo "published $(git rev-parse --short HEAD)" | tee -a "$RUNNER_TEMP/results.txt"
 
       # Pushes made with GITHUB_TOKEN do not start other workflows. Java CI is therefore
       # dispatched by hand when no PAT is configured; a PAT push already starts it.
@@ -132,7 +217,7 @@ jobs:
         run: |
           for attempt in 1 2 3 4 5; do
             if gh workflow run gradle.yml --ref "$BRANCH"; then
-              echo "Java CI dispatched." | tee -a results.txt
+              echo "Java CI dispatched." | tee -a "$RUNNER_TEMP/results.txt"
               exit 0
             fi
             sleep 5
@@ -146,8 +231,14 @@ jobs:
             echo "Upstream: https://github.com/${UPSTREAM}/commit/${upstream}"
             echo
             echo '```'
-            cat results.txt 2>/dev/null || echo 'no upstream change, nothing published'
+            cat "$RUNNER_TEMP/results.txt" 2>/dev/null || echo 'no upstream change, nothing published'
             echo '```'
+            if [ -s "$RUNNER_TEMP/resolved.txt" ]; then
+              echo
+              echo 'Automatically resolved while replaying the patches:'
+              echo
+              cat "$RUNNER_TEMP/resolved.txt"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Issues are disabled on this fork, so the failure is surfaced through the step summary
@@ -164,5 +255,17 @@ jobs:
             echo
             echo "- 上游：${upstream_url}"
             echo "- 失败的运行：${run_url}"
+            if [ -s "$RUNNER_TEMP/conflicts.txt" ]; then
+              echo
+              echo '以下文件在上游被改动，补丁无法自动合并，需要人工改写对应的补丁提交：'
+              echo
+              cat "$RUNNER_TEMP/conflicts.txt"
+            fi
+            if [ -s "$RUNNER_TEMP/resolved.txt" ]; then
+              echo
+              echo '本次已自动处理：'
+              echo
+              cat "$RUNNER_TEMP/resolved.txt"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::error title=上游同步失败::本地补丁重放、编译校验、推送或构建触发失败，详见 ${run_url}"
